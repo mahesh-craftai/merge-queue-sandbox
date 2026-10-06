@@ -1,2 +1,2 @@
-service a v1
+service a c2
 feature 1
