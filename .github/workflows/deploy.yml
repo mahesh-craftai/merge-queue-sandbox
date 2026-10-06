@@ -1,0 +1,41 @@
+# Stub deploy, called by merge-queue.yml after a batch merges (or run by hand).
+# Fails when any service file contains the line `DEPLOY: fail`.
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: main commit to deploy
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to deploy (default main)
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Job-level so it also applies when called from the queue.
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Deploy
+        run: |
+          sleep 10
+          if grep -rqx "DEPLOY: fail" svc-a svc-b; then
+            echo "::error::Deploy failed (found 'DEPLOY: fail'); services rolled back"
+            exit 1
+          fi
+          echo "Deployed $(git rev-parse --short HEAD)"

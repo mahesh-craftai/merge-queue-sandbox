@@ -1,0 +1,105 @@
+# Merge queue: the only way code reaches main, and the only CI that runs.
+# Add the `merge-queue` label to an approved PR; this tests every queued PR
+# together on top of main, merges them, deploys once, then takes the next batch.
+# Logic and state model: .github/scripts/mq.py.
+name: Merge queue
+
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]
+  # Closing the pause issue by hand restarts the held PRs.
+  issues:
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  statuses: write
+  actions: write
+
+# One batch at a time. Other labels get their own throwaway group, so they
+# never displace a waiting queue run. GitHub keeps only one waiting run per
+# group; that's fine because every run re-reads the whole queue from labels.
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.label.name == 'merge-queue' || github.event.label.name == 'mq-priority' || (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'mq-paused'))) && 'merge-queue' || format('mq-ignore-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  MQ_REQUIRE_APPROVAL: ${{ vars.MQ_REQUIRE_APPROVAL || 'true' }}
+  MQ_MAX_BATCH: ${{ vars.MQ_MAX_BATCH || '5' }}
+  MQ_WORKFLOW: merge-queue.yml
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'merge-queue' || github.event.label.name == 'mq-priority' || (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'mq-paused'))
+    runs-on: ubuntu-latest
+    outputs:
+      has_batch: ${{ steps.plan.outputs.has_batch }}
+      batch: ${{ steps.plan.outputs.batch }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      batch_sha: ${{ steps.plan.outputs.batch_sha }}
+      had_priority: ${{ steps.plan.outputs.had_priority }}
+    steps:
+      # Scripts always come from main, never from a PR branch.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: plan
+        run: python3 .github/scripts/mq.py plan
+
+  ci:
+    needs: plan
+    if: needs.plan.outputs.has_batch == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.plan.outputs.batch_sha }}
+      base: ${{ needs.plan.outputs.base_sha }}
+
+  finish:
+    needs: [plan, ci]
+    if: always() && needs.plan.outputs.has_batch == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.finish.outputs.merged }}
+      main_sha: ${{ steps.finish.outputs.main_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: finish
+        env:
+          BATCH: ${{ needs.plan.outputs.batch }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          BATCH_SHA: ${{ needs.plan.outputs.batch_sha }}
+          CI_RESULT: ${{ needs.ci.result }}
+          HAD_BATCH: ${{ needs.plan.outputs.has_batch }}
+        run: python3 .github/scripts/mq.py finish
+
+  deploy:
+    needs: finish
+    if: always() && needs.finish.outputs.merged == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ needs.finish.outputs.main_sha }}
+
+  after-deploy:
+    needs: [plan, finish, deploy]
+    if: always() && needs.finish.outputs.merged == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - env:
+          BATCH: ${{ needs.plan.outputs.batch }}
+          MAIN_SHA: ${{ needs.finish.outputs.main_sha }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          HAD_PRIORITY: ${{ needs.plan.outputs.had_priority }}
+          HAD_BATCH: ${{ needs.plan.outputs.has_batch }}
+        run: python3 .github/scripts/mq.py after-deploy
