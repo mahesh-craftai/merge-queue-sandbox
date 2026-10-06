@@ -1,41 +1,108 @@
-# Stub deploy, called by merge-queue.yml after a batch merges (or run by hand).
-# Fails when any service file contains the line `DEPLOY: fail`.
+# Stub deploy mirroring rocketsingh's deploy.yml shape: queue call or manual
+# run, nested CI on manual runs, dynamic image matrix with per-image outputs,
+# job-level deploy concurrency. Deploy fails on a line `DEPLOY: fail`.
 name: Deploy
 
 on:
   workflow_call:
     inputs:
       ref:
-        description: main commit to deploy
         required: true
         type: string
+      base:
+        required: true
+        type: string
+      skip_tests:
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
-      ref:
-        description: Commit to deploy (default main)
-        required: false
-        type: string
-        default: main
+      service:
+        type: choice
+        options: [all, svc-a, svc-b]
+        default: all
+      skip_tests:
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  deploy:
+  detect-changes:
     runs-on: ubuntu-latest
-    # Job-level so it also applies when called from the queue.
+    outputs:
+      build-matrix: ${{ steps.plan.outputs.build-matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - id: plan
+        env:
+          BASE: ${{ inputs.base }}
+          REF: ${{ inputs.ref || github.sha }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          if [[ -n "$BASE" ]]; then CHANGED=$(git diff --name-only "$BASE" "$REF"); else CHANGED=""; fi
+          M="["; SEP=""
+          for svc in svc-a svc-b; do
+            if { [[ -n "$BASE" ]] && grep -q "^$svc/" <<< "$CHANGED"; } || [[ -z "$BASE" && ( "$SERVICE" == all || "$SERVICE" == "$svc" ) ]]; then
+              M="$M$SEP{\"name\":\"$svc\"}"; SEP=","
+            fi
+          done
+          echo "build-matrix=$M]" >> "$GITHUB_OUTPUT"; echo "images: $M]"
+
+  ci:
+    if: inputs.skip_tests != true
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.sha }}
+      base: ${{ github.sha }}
+      all: true
+
+  build-push:
+    if: |
+      !cancelled()
+      && needs.detect-changes.outputs.build-matrix != '[]'
+      && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
+    needs: [detect-changes, ci]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.build-matrix) }}
+    outputs:
+      svc-a-image: ${{ steps.output.outputs.svc-a-image }}
+      svc-b-image: ${{ steps.output.outputs.svc-b-image }}
+    steps:
+      - id: output
+        env:
+          DEPLOY_SHA: ${{ inputs.ref || github.sha }}
+        run: |
+          sleep 3
+          echo "${{ matrix.name }}-image=registry/${{ matrix.name }}:${DEPLOY_SHA::7}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    if: |
+      !cancelled()
+      && needs.build-push.result == 'success'
+      && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
+    needs: [build-push, ci]
+    runs-on: ubuntu-latest
     concurrency:
       group: deploy
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
       - name: Deploy
+        env:
+          A: ${{ needs.build-push.outputs.svc-a-image }}
+          B: ${{ needs.build-push.outputs.svc-b-image }}
         run: |
-          sleep 10
-          if grep -rqx "DEPLOY: fail" svc-a svc-b; then
-            echo "::error::Deploy failed (found 'DEPLOY: fail'); services rolled back"
-            exit 1
-          fi
+          echo "svc-a image: '${A}'"; echo "svc-b image: '${B}'"
+          if grep -rqx "DEPLOY: fail" svc-a svc-b; then echo "::error::Deploy failed; rolled back"; exit 1; fi
           echo "Deployed $(git rev-parse --short HEAD)"

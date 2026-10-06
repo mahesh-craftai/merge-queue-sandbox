@@ -20,8 +20,12 @@ off and a dropped or cancelled run loses nothing:
   mq-paused     label on an open issue: a deploy failed, normal PRs wait
   merge-queue   commit status on a PR head: only the queue sets it, and main's
                 branch protection requires it, so nobody can merge around us
+
+Repo-specific PR checks (title, description, ...) live in mq_checks.py next to
+this file, if present: check(pr, files, read_file) -> (errors, warnings).
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -119,7 +123,8 @@ query($owner: String!, $name: String!, $base: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, baseRefName: $base, labels: ["merge-queue"], first: 50) {
       nodes {
-        number title isDraft headRefOid
+        number title body isDraft headRefOid
+        author { login }
         labels(first: 30) { nodes { name } }
         latestReviews(first: 50) { nodes { state commit { oid } } }
         timelineItems(itemTypes: [LABELED_EVENT], last: 50) {
@@ -141,7 +146,8 @@ def queued_prs():
         queued_at = max((e["createdAt"] for e in n["timelineItems"]["nodes"]
                          if e and e["label"]["name"] == QUEUE), default="")
         prs.append({
-            "number": n["number"], "title": n["title"], "draft": n["isDraft"],
+            "number": n["number"], "title": n["title"], "body": n["body"] or "",
+            "author": (n["author"] or {}).get("login", ""), "draft": n["isDraft"],
             "head": n["headRefOid"], "labels": labels, "queued_at": queued_at,
             "reviews": n["latestReviews"]["nodes"],
         })
@@ -165,6 +171,36 @@ def rejection_reason(pr):
                for r in pr["reviews"]):
         return "it has no approval on its latest commit"
     return None
+
+
+def load_repo_checks():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mq_checks.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("mq_checks", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.check
+
+
+def changed_files(pr):
+    r = sh("gh", "api", "--paginate", f"repos/{REPO}/pulls/{pr['number']}/files?per_page=100",
+           "-q", ".[].filename")
+    return [f for f in r.stdout.splitlines() if f]
+
+
+def repo_check_errors(check, pr):
+    """Run mq_checks.check on one PR; warnings go to the log, errors are returned."""
+    sh("git", "fetch", "--quiet", "origin", pr["head"])
+
+    def read_file(path):
+        r = sh("git", "show", f"{pr['head']}:{path}", check=False)
+        return r.stdout if r.returncode == 0 else None
+
+    errors, warnings = check(pr, changed_files(pr), read_file)
+    for w in warnings:
+        print(f"::warning::#{pr['number']}: {w}")
+    return errors
 
 
 def reject(pr, why):
@@ -191,9 +227,14 @@ def plan():
             print(f"Queue paused (issue #{paused}); holding {held}")
         prs = [p for p in prs if PRIORITY in p["labels"]]
 
+    check = load_repo_checks()
     eligible = []
     for p in prs:
         why = rejection_reason(p)
+        if not why and check:
+            errors = repo_check_errors(check, p)
+            if errors:
+                why = "the PR checks failed: " + " ".join(errors)
         if why:
             print(f"#{p['number']} rejected: {why}")
             reject(p, why)
@@ -221,7 +262,7 @@ def plan():
         r = sh("git", "merge", "--no-ff", "--no-edit", "-m", f"Merge #{n}: {p['title']}",
                p["head"], check=False)
         if r.returncode == 0:
-            batch.append({"number": n, "head": p["head"]})
+            batch.append({"number": n, "head": p["head"], "author": p["author"]})
             continue
         sh("git", "merge", "--abort", check=False)
         if not batch:
@@ -314,7 +355,7 @@ def finish():
             output(merged="false")
             next_run()
             return
-        open_pause_issue(f"Merging #{b['number']} was refused ({why}) after {', '.join(merged)} "
+        open_pause_issue(batch, f"Merging #{b['number']} was refused ({why}) after {', '.join(merged)} "
                          f"had merged, so `{BASE_BRANCH}` holds only part of a tested batch. "
                          "Check it, then close this issue.")
         output(merged="false")
@@ -327,7 +368,7 @@ def finish():
     tree_main = sh("git", "rev-parse", f"{new_main}^{{tree}}").stdout.strip()
     tree_tested = sh("git", "rev-parse", f"{batch_sha}^{{tree}}").stdout.strip()
     if tree_main != tree_tested:
-        open_pause_issue(f"After merging {nums}, `{BASE_BRANCH}` ({new_main[:7]}) differs from "
+        open_pause_issue(batch, f"After merging {nums}, `{BASE_BRANCH}` ({new_main[:7]}) differs from "
                          f"the tested batch ({batch_sha[:7]}). Not deploying. Investigate, "
                          "then close this issue.")
         output(merged="false")
@@ -340,16 +381,22 @@ def finish():
     output(merged="true", main_sha=new_main)
 
 
-def open_pause_issue(body):
+def open_pause_issue(batch, body):
+    """Pause the queue (or add to the open pause issue), owned by the batch's authors."""
+    authors = sorted({b.get("author") for b in batch if b.get("author")})
     num = pause_issue()
     if num:
         comment(num, body)
-        return num
-    issue, _ = gh_api(f"repos/{REPO}/issues", "POST", {
-        "title": "Merge queue paused", "labels": [PAUSED],
-        "body": body + f"\n\nOnly PRs labelled `{PRIORITY}` (with `{QUEUE}`) go through until "
-                       f"this issue is closed. A successful `{PRIORITY}` deploy closes it."})
-    return issue["number"]
+    else:
+        issue, _ = gh_api(f"repos/{REPO}/issues", "POST", {
+            "title": "Merge queue paused", "labels": [PAUSED],
+            "body": body + f"\n\nOnly PRs labelled `{PRIORITY}` (with `{QUEUE}`) go through "
+                           f"until this issue is closed. A successful `{PRIORITY}` deploy closes it."})
+        num = issue["number"]
+    if authors:
+        # Separate call: an author who can't be assigned (a bot) mustn't block the pause.
+        gh_api(f"repos/{REPO}/issues/{num}/assignees", "POST", {"assignees": authors}, check=False)
+    return num
 
 
 def after_deploy():
@@ -357,7 +404,8 @@ def after_deploy():
     result = os.environ["DEPLOY_RESULT"]
     main_sha = os.environ["MAIN_SHA"]
     nums = ", ".join(f"#{b['number']}" for b in batch)
-    if result == "success":
+    # "skipped": no image changed (docs-only batch), so nothing to roll out.
+    if result in ("success", "skipped"):
         for b in batch:
             comment(b["number"], f"Deployed `{main_sha[:7]}` ([run]({RUN_URL})).")
         num = pause_issue()
@@ -366,7 +414,7 @@ def after_deploy():
             gh_api(f"repos/{REPO}/issues/{num}", "PATCH", {"state": "closed"})
         next_run()
         return
-    num = open_pause_issue(f"Deploying `{main_sha[:7]}` (batch {nums}) failed: [run]({RUN_URL}). "
+    num = open_pause_issue(batch, f"Deploying `{main_sha[:7]}` (batch {nums}) failed: [run]({RUN_URL}). "
                            "Services were rolled back to their previous version, but the code "
                            f"is on `{BASE_BRANCH}`. Open a revert or fix PR with labels "
                            f"`{QUEUE}` + `{PRIORITY}`.")

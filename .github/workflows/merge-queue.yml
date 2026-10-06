@@ -56,6 +56,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.has_batch == 'true'
     uses: ./.github/workflows/ci.yml
+    secrets: inherit
     with:
       ref: ${{ needs.plan.outputs.batch_sha }}
       base: ${{ needs.plan.outputs.base_sha }}
@@ -82,11 +83,13 @@ jobs:
         run: python3 .github/scripts/mq.py finish
 
   deploy:
-    needs: finish
+    needs: [plan, finish]
     if: always() && needs.finish.outputs.merged == 'true'
     uses: ./.github/workflows/deploy.yml
+    secrets: inherit
     with:
       ref: ${{ needs.finish.outputs.main_sha }}
+      base: ${{ needs.plan.outputs.base_sha }}
 
   after-deploy:
     needs: [plan, finish, deploy]

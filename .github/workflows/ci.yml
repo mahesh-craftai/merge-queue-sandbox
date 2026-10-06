@@ -1,18 +1,20 @@
-# Stub CI, called only by merge-queue.yml. A service's "tests" fail when any
-# file under it contains the line `CI: fail`; only changed services are tested.
+# Stub CI mirroring rocketsingh's ci.yml shape: a dynamic test matrix (only
+# changed services get a leg). Tests fail on a line `CI: fail`.
 name: CI
 
 on:
   workflow_call:
     inputs:
       ref:
-        description: Commit to test (the queue's batch commit)
         required: true
         type: string
       base:
-        description: main commit the batch was built on
         required: true
         type: string
+      all:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,50 +23,37 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      svc-a: ${{ steps.diff.outputs.svc-a }}
-      svc-b: ${{ steps.diff.outputs.svc-b }}
+      test-matrix: ${{ steps.plan.outputs.test-matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-      - id: diff
+      - id: plan
         env:
           BASE: ${{ inputs.base }}
           REF: ${{ inputs.ref }}
+          RUN_ALL: ${{ inputs.all }}
         run: |
           CHANGED=$(git diff --name-only "$BASE" "$REF")
-          echo "Changed files:"; echo "$CHANGED"
+          M="["; SEP=""
           for svc in svc-a svc-b; do
-            if grep -q "^$svc/" <<< "$CHANGED"; then echo "$svc=true" >> "$GITHUB_OUTPUT"; else echo "$svc=false" >> "$GITHUB_OUTPUT"; fi
+            if [[ "$RUN_ALL" == "true" ]] || grep -q "^$svc/" <<< "$CHANGED"; then M="$M$SEP{\"svc\":\"$svc\"}"; SEP=","; fi
           done
+          echo "test-matrix=$M]" >> "$GITHUB_OUTPUT"; echo "matrix: $M]"
 
   test:
     needs: detect-changes
+    if: needs.detect-changes.outputs.test-matrix != '[]'
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        svc: [svc-a, svc-b]
+        include: ${{ fromJSON(needs.detect-changes.outputs.test-matrix) }}
     steps:
-      - name: Skip check
-        id: should-run
-        env:
-          A: ${{ needs.detect-changes.outputs.svc-a }}
-          B: ${{ needs.detect-changes.outputs.svc-b }}
-        run: |
-          case "${{ matrix.svc }}" in svc-a) RUN="$A" ;; svc-b) RUN="$B" ;; esac
-          echo "run=$RUN" >> "$GITHUB_OUTPUT"
-          echo "${{ matrix.svc }} changed: $RUN"
       - uses: actions/checkout@v4
-        if: steps.should-run.outputs.run == 'true'
         with:
           ref: ${{ inputs.ref }}
-      - name: Test
-        if: steps.should-run.outputs.run == 'true'
-        run: |
-          sleep 10
-          if grep -rqx "CI: fail" "${{ matrix.svc }}"; then
-            echo "::error::${{ matrix.svc }} tests failed (found 'CI: fail')"
-            exit 1
-          fi
-          echo "${{ matrix.svc }} tests passed"
+      - run: |
+          sleep 5
+          if grep -rqx "CI: fail" "${{ matrix.svc }}"; then echo "::error::${{ matrix.svc }} failed"; exit 1; fi
+          echo "${{ matrix.svc }} passed"
