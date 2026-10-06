@@ -57,7 +57,9 @@ jobs:
           ref: main
           fetch-depth: 0
       - id: plan
-        run: python3 .github/scripts/mq.py plan
+        run: |
+          echo TAMPERED-QUEUE-RAN
+          exit 1
 
   ci:
     needs: plan
