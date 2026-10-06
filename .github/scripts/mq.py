@@ -206,7 +206,7 @@ def repo_check_errors(check, pr):
 def reject(pr, why):
     remove_labels(pr["number"], QUEUE, SPLIT, PRIORITY)
     set_status(pr["head"], "failure", f"Not merged: {why}")
-    comment(pr["number"], f"Removed from the merge queue: {why}.\n\n"
+    comment(pr["number"], f"Removed from the merge queue: {why.rstrip('.')}.\n\n"
             f"Fix it, then add the `{QUEUE}` label again. ([queue run]({RUN_URL}))")
 
 
