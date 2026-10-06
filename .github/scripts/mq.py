@@ -40,6 +40,9 @@ BATCH_BRANCH = os.environ.get("MQ_BATCH_BRANCH", "mq/batch")
 MAX_BATCH = int(os.environ.get("MQ_MAX_BATCH", "5"))
 REQUIRE_APPROVAL = os.environ.get("MQ_REQUIRE_APPROVAL", "true").lower() == "true"
 MERGE_METHOD = os.environ.get("MQ_MERGE_METHOD", "squash")
+# Repos with nothing to deploy (a library) set this to false: finish then ends
+# the batch itself instead of handing over to deploy/after-deploy.
+HAS_DEPLOY = os.environ.get("MQ_HAS_DEPLOY", "true").lower() == "true"
 
 QUEUE, PRIORITY, SPLIT, PAUSED = "merge-queue", "mq-priority", "mq-split", "mq-paused"
 STATUS_CONTEXT = "merge-queue"
@@ -377,8 +380,11 @@ def finish():
 
     for b in batch:
         remove_labels(b["number"], QUEUE, SPLIT, PRIORITY)
-        comment(b["number"], f"Merged in batch {nums} ([run]({RUN_URL})). Deploying now.")
+        comment(b["number"], f"Merged in batch {nums} ([run]({RUN_URL}))."
+                + (" Deploying now." if HAS_DEPLOY else ""))
     output(merged="true", main_sha=new_main)
+    if not HAS_DEPLOY:
+        next_run()
 
 
 def open_pause_issue(batch, body):

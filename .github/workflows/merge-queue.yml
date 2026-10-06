@@ -31,6 +31,8 @@ env:
   MQ_REQUIRE_APPROVAL: ${{ vars.MQ_REQUIRE_APPROVAL || 'true' }}
   MQ_MAX_BATCH: ${{ vars.MQ_MAX_BATCH || '5' }}
   MQ_WORKFLOW: merge-queue.yml
+  # Sandbox only: a repo variable switches the no-deploy (library) path on.
+  MQ_HAS_DEPLOY: ${{ vars.MQ_HAS_DEPLOY || 'true' }}
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -84,7 +86,7 @@ jobs:
 
   deploy:
     needs: [plan, finish]
-    if: always() && needs.finish.outputs.merged == 'true'
+    if: always() && needs.finish.outputs.merged == 'true' && vars.MQ_HAS_DEPLOY != 'false'
     uses: ./.github/workflows/deploy.yml
     secrets: inherit
     with:
@@ -93,7 +95,7 @@ jobs:
 
   after-deploy:
     needs: [plan, finish, deploy]
-    if: always() && needs.finish.outputs.merged == 'true'
+    if: always() && needs.finish.outputs.merged == 'true' && vars.MQ_HAS_DEPLOY != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
