@@ -5,7 +5,12 @@
 name: Merge queue
 
 on:
-  pull_request:
+  # pull_request_target, not pull_request: a label event then runs main's copy
+  # of this workflow. Under pull_request it would run the PR's own copy, so a
+  # PR editing the queue or deploy would execute its edits, with write access
+  # and secrets, before anyone reviewed them. Safe here because nothing in the
+  # queue checks out or runs PR code outside the tested batch commit.
+  pull_request_target:
     types: [labeled]
     branches: [main]
   # Closing the pause issue by hand restarts the held PRs.
