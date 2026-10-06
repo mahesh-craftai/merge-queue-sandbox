@@ -64,7 +64,11 @@ def gh_api(path, method="GET", fields=None, check=True):
                        input=json.dumps(fields) if fields is not None else None)
     if check and r.returncode != 0:
         sys.exit(f"gh api {method} {path} failed: {r.stdout} {r.stderr}")
-    return (json.loads(r.stdout) if r.stdout.strip() else None), r.returncode
+    try:
+        body = json.loads(r.stdout) if r.stdout.strip() else None
+    except json.JSONDecodeError:
+        body = None
+    return body, r.returncode
 
 
 def graphql(query, **variables):
@@ -296,16 +300,26 @@ def finish():
         set_status(b["head"], "success", f"Passed in batch with {nums}")
     merged = []
     for b in batch:
-        _, rc = gh_api(f"repos/{REPO}/pulls/{b['number']}/merge", "PUT",
-                       {"merge_method": MERGE_METHOD, "sha": b["head"]}, check=False)
-        if rc != 0:
-            open_pause_issue(f"Merging #{b['number']} failed after {', '.join(merged) or 'nothing'} "
-                             f"had merged, so `{BASE_BRANCH}` may hold only part of a tested "
-                             "batch. Check it, then close this issue.")
+        resp, rc = gh_api(f"repos/{REPO}/pulls/{b['number']}/merge", "PUT",
+                          {"merge_method": MERGE_METHOD, "sha": b["head"]}, check=False)
+        if rc == 0:
+            merged.append(f"#{b['number']}")
+            continue
+        why = (resp or {}).get("message", "GitHub refused the merge")
+        if not merged:
+            # Refused before anything landed (usually branch protection, e.g. a
+            # missing approval): main is untouched, so drop just this PR and
+            # re-test the rest without it, rather than stopping the queue.
+            reject(current[b["number"]], f"GitHub refused the merge: {why}")
             output(merged="false")
             next_run()
             return
-        merged.append(f"#{b['number']}")
+        open_pause_issue(f"Merging #{b['number']} was refused ({why}) after {', '.join(merged)} "
+                         f"had merged, so `{BASE_BRANCH}` holds only part of a tested batch. "
+                         "Check it, then close this issue.")
+        output(merged="false")
+        next_run()
+        return
 
     # Sequential merges onto an unchanged main must reproduce the tested tree.
     sh("git", "fetch", "--quiet", "origin", BASE_BRANCH)
